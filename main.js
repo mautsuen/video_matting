@@ -1,19 +1,47 @@
-// main.js (FPS synced: infer + draw same tick, uniform zoom to avoid distortion on portrait)
-import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/ort.all.min.mjs";
+// main.js
+import * as ort from "https://unpkg.com/onnxruntime-web@1.23.2/dist/ort.all.min.mjs";
 
 const $ = (id) => document.getElementById(id);
 
 const startBtn = $("start");
 const stopBtn  = $("stop");
-const fpsSel   = $("fps");
-const inferSizeSel = $("inferSize");
-const bgSel    = $("bg");
-
-const video  = $("video");
-const out    = $("out");
+const video    = $("video");
+const out      = $("out");
 const statusEl = $("status");
 
-const outCtx = out.getContext("2d", { willReadFrequently: true });
+// Your UI (some may be null depending on your HTML)
+const drawFpsSel  = $("fps");        // "Draw FPS"
+const inferFpsSel = $("inferFps");   // "Infer FPS"
+const inferSizeSel= $("inferSize");  // "Infer short edge"
+const bgSel       = $("bg");
+
+// --------- Tuning ----------
+const MIRROR = true; // if your <video> uses CSS scaleX(-1), keep this true so output matches
+const FORCE_LANDSCAPE_AR_ON_PORTRAIT = true;
+// This matches your Python pipeline's final tensor aspect (672x512)
+const TARGET_AR = 672 / 512;
+
+// Matte sanity thresholds (avoid "suddenly all white")
+const MIN_MEAN_ALPHA = 0.02;  // too small -> basically empty matte
+const MIN_MAX_ALPHA  = 0.10;  // max too small -> basically empty matte
+const BAD_STREAK_TO_FALLBACK = 3;
+
+// ORT paths
+const WASM_BASE = "./wasm/"; // must contain ort-wasm*.wasm/.mjs files (your local setup)
+const MODEL_DIR = "./models/Xenova/modnet/onnx/";
+const MODEL_FP16 = MODEL_DIR + "model_fp16.onnx";
+const MODEL_FP32 = MODEL_DIR + "model.onnx";
+
+// --------- State ----------
+let running = false;
+let stream = null;
+
+let session = null;
+let inputName = "input";
+let outputName = "output";
+let usingEP = "none"; // "webgpu/fp16" | "webgpu/fp32" | "wasm/fp32"
+
+const outCtx = out.getContext("2d", { willReadFrequently: false });
 
 const inferCanvas = document.createElement("canvas");
 const inferCtx = inferCanvas.getContext("2d", { willReadFrequently: true });
@@ -21,266 +49,374 @@ const inferCtx = inferCanvas.getContext("2d", { willReadFrequently: true });
 const maskCanvas = document.createElement("canvas");
 const maskCtx = maskCanvas.getContext("2d", { willReadFrequently: true });
 
-// ====== Tunables ======
-const MIRROR = true;
+const lastGoodMask = document.createElement("canvas");
+const lastGoodCtx = lastGoodMask.getContext("2d", { willReadFrequently: false });
 
-// ✅ Uniform zoom only (NO ZOOM_X/ZOOM_Y)
-// Portrait phones: keep zoom near 1.0 to avoid warping faces
-const ZOOM_LANDSCAPE = 1.20; // mild zoom-in on PC
-const ZOOM_PORTRAIT  = 1.00; // critical: no anisotropic zoom on phone portrait
+let matteReady = false;
+let badMatteStreak = 0;
+let lastInferTS = 0;
 
-const AUTO_INVERT = true;
-const MASK_GAMMA  = 0.75;
-const MASK_BLUR_PX = 1.2;
-
-const MAX_WASM_THREADS = 8;
-
-// ====== State ======
-let running = false;
-let loopTimer = null;
-
-let session = null;
-let inputName = null;
-let outputName = null;
-let using = "none";
-
-let maskReady = false;
-
-function setStatus(s) {
-  statusEl.textContent = s;
-  console.log(s);
+function logStatus(msg) {
+  statusEl.textContent = msg;
+  console.log(msg);
 }
 
-function clamp01(x) {
-  return x < 0 ? 0 : (x > 1 ? 1 : x);
-}
-
-function roundDownTo(n, d) {
-  return Math.max(d, Math.floor(n / d) * d);
-}
-
-// Decide zoom based on current orientation (video or canvas)
-function currentZoom() {
+function isPortraitVideo() {
   const vw = video.videoWidth || 0;
   const vh = video.videoHeight || 0;
-  const portrait = (vh > vw) || (out.height > out.width);
-  return portrait ? ZOOM_PORTRAIT : ZOOM_LANDSCAPE;
+  return vw > 0 && vh > 0 && vh > vw;
 }
 
-// ✅ Uniform "cover + zoom" (single zoom factor, no distortion)
-function drawVideoCover(ctx, vid, dstW, dstH, mirror, zoom = 1.0) {
-  const vw = vid.videoWidth || 1;
-  const vh = vid.videoHeight || 1;
+function getInferFPS() {
+  // You asked draw fps == infer fps
+  const v = inferFpsSel?.value ?? drawFpsSel?.value ?? "10";
+  return Math.max(1, parseInt(v, 10) || 10);
+}
 
-  // base cover scale
-  const baseScale = Math.max(dstW / vw, dstH / vh);
+function syncFPS() {
+  if (!drawFpsSel || !inferFpsSel) return;
+  // keep them identical
+  const setBoth = (val) => {
+    drawFpsSel.value = val;
+    inferFpsSel.value = val;
+  };
+  setBoth(inferFpsSel.value || drawFpsSel.value || "10");
 
-  // uniform zoom => sw/sh shrink together => no aspect warping
-  const sw = dstW / (baseScale * zoom);
-  const sh = dstH / (baseScale * zoom);
+  inferFpsSel.addEventListener("change", () => setBoth(inferFpsSel.value));
+  drawFpsSel.addEventListener("change", () => setBoth(drawFpsSel.value));
+}
 
-  const sx = (vw - sw) * 0.5;
-  const sy = (vh - sh) * 0.5;
+function getInferShortEdge() {
+  const v = inferSizeSel?.value ?? "512";
+  return Math.max(128, parseInt(v, 10) || 512);
+}
+
+function getBGMode() {
+  return bgSel?.value ?? "white";
+}
+
+function setCanvasSizes() {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return;
+
+  const outW = 480;
+
+  let outH;
+  if (FORCE_LANDSCAPE_AR_ON_PORTRAIT && vh > vw) {
+    // portrait camera -> force a landscape-ish crop so face stays "normal size" for MODNet
+    outH = Math.round(outW / TARGET_AR);
+  } else {
+    outH = Math.round(outW * (vh / vw));
+  }
+
+  out.width = outW;
+  out.height = outH;
+
+  // Make video element show the SAME crop region (so preview matches output)
+  video.style.width = outW + "px";
+  video.style.height = outH + "px";
+  video.style.objectFit = "cover";
+  if (MIRROR) {
+    video.style.transform = "scaleX(-1)";
+  } else {
+    video.style.transform = "";
+  }
+
+  // Infer tensor size keeps aspect ratio of out canvas
+  const shortEdge = getInferShortEdge();
+  let inferW, inferH;
+  if (outW >= outH) {
+    inferH = shortEdge;
+    inferW = Math.round(shortEdge * (outW / outH));
+  } else {
+    inferW = shortEdge;
+    inferH = Math.round(shortEdge * (outH / outW));
+  }
+
+  // multiples of 32 helps MODNet/conv speed and some backends
+  inferW = Math.max(32, Math.round(inferW / 32) * 32);
+  inferH = Math.max(32, Math.round(inferH / 32) * 32);
+
+  inferCanvas.width = inferW;
+  inferCanvas.height = inferH;
+
+  maskCanvas.width = inferW;
+  maskCanvas.height = inferH;
+
+  lastGoodMask.width = inferW;
+  lastGoodMask.height = inferH;
+
+  console.log(`out=${outW}x${outH}, infer=${inferW}x${inferH}, video=${vw}x${vh}`);
+}
+
+function drawVideoCover(ctx, w, h, mirror) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return;
+
+  const sAR = vw / vh;
+  const dAR = w / h;
+
+  let sw, sh, sx, sy;
+  if (sAR > dAR) {
+    // source wider -> crop left/right
+    sh = vh;
+    sw = Math.round(vh * dAR);
+    sx = Math.round((vw - sw) / 2);
+    sy = 0;
+  } else {
+    // source taller -> crop top/bottom
+    sw = vw;
+    sh = Math.round(vw / dAR);
+    sx = 0;
+    sy = Math.round((vh - sh) / 2);
+  }
 
   ctx.save();
   if (mirror) {
-    ctx.translate(dstW, 0);
+    ctx.translate(w, 0);
     ctx.scale(-1, 1);
   }
-  ctx.drawImage(vid, sx, sy, sw, sh, 0, 0, dstW, dstH);
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
   ctx.restore();
 }
 
-function buildInputTensorFromCanvas(ctx, w, h) {
-  const img = ctx.getImageData(0, 0, w, h);
-  const data = img.data; // RGBA
-  const chw = new Float32Array(3 * w * h);
-  const area = w * h;
+function buildInputTensorFloat32() {
+  const { width: W, height: H } = inferCanvas;
+  const img = inferCtx.getImageData(0, 0, W, H).data;
 
-  // normalize: v/127.5 - 1
-  for (let i = 0; i < area; i++) {
-    const r = data[i * 4 + 0];
-    const g = data[i * 4 + 1];
-    const b = data[i * 4 + 2];
-    chw[i] = r / 127.5 - 1.0;
-    chw[area + i] = g / 127.5 - 1.0;
-    chw[2 * area + i] = b / 127.5 - 1.0;
-  }
-
-  return new ort.Tensor("float32", chw, [1, 3, h, w]);
-}
-
-function updateMaskFromOutput(outTensor) {
-  const dims = outTensor.dims;
-  const data = outTensor.data;
-
-  let H, W, C = 1;
-  let layout;
-
-  if (dims.length === 4) {
-    C = dims[1];
-    H = dims[2];
-    W = dims[3];
-    layout = "NCHW";
-  } else if (dims.length === 3) {
-    H = dims[1];
-    W = dims[2];
-    layout = "NHW";
-  } else {
-    throw new Error(`Unexpected output dims: ${JSON.stringify(dims)}`);
-  }
-
-  maskCanvas.width = W;
-  maskCanvas.height = H;
-
-  const img = maskCtx.createImageData(W, H);
-  const rgba = img.data;
-
-  const t = outTensor.type;
-  const isUint8 = (t === "uint8");
-  const isInt8  = (t === "int8");
-
-  function getValAt(i) {
-    const base = (layout === "NCHW" && C > 1) ? i : i;
-    let v = data[base];
-    if (isUint8) v = v / 255;
-    else if (isInt8) v = (v + 128) / 255;
-    return v;
-  }
-
-  // detect logits
-  let needSigmoid = false;
-  if (!isUint8 && !isInt8) {
-    for (let k = 0; k < Math.min(W * H, 2000); k += 113) {
-      const v = getValAt(k);
-      if (v < -0.1 || v > 1.1) { needSigmoid = true; break; }
-    }
-  }
-
-  function sigmoid(x) {
-    if (x >= 0) {
-      const z = Math.exp(-x);
-      return 1 / (1 + z);
-    } else {
-      const z = Math.exp(x);
-      return z / (1 + z);
-    }
-  }
-
-  // auto invert heuristic
-  const step = Math.max(1, Math.floor(Math.min(W, H) / 64));
-  const cx0 = Math.floor(W * 0.25), cx1 = Math.floor(W * 0.75);
-  const cy0 = Math.floor(H * 0.25), cy1 = Math.floor(H * 0.75);
-
-  let centerSum = 0, centerCnt = 0;
-  let borderSum = 0, borderCnt = 0;
-
-  for (let y = 0; y < H; y += step) {
-    for (let x = 0; x < W; x += step) {
-      const i = y * W + x;
-      let v = getValAt(i);
-      if (needSigmoid) v = sigmoid(v);
-      v = clamp01(v);
-
-      const inCenter = (x >= cx0 && x < cx1 && y >= cy0 && y < cy1);
-      const inBorder = (x < W * 0.08 || x > W * 0.92 || y < H * 0.08 || y > H * 0.92);
-
-      if (inCenter) { centerSum += v; centerCnt++; }
-      if (inBorder) { borderSum += v; borderCnt++; }
-    }
-  }
-
-  const centerMean = centerCnt ? centerSum / centerCnt : 0.5;
-  const borderMean = borderCnt ? borderSum / borderCnt : 0.5;
-  const doInvert = AUTO_INVERT && (centerMean < borderMean);
+  // NCHW float32 normalized to [-1, 1]
+  const data = new Float32Array(1 * 3 * H * W);
+  const HW = H * W;
 
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
-      const i = y * W + x;
-      let v = getValAt(i);
-      if (needSigmoid) v = sigmoid(v);
-      v = clamp01(v);
-      if (doInvert) v = 1.0 - v;
+      const p = (y * W + x);
+      const i = p * 4;
 
-      v = Math.pow(v, MASK_GAMMA);
-      const a = Math.round(clamp01(v) * 255);
+      const r = img[i] / 255;
+      const g = img[i + 1] / 255;
+      const b = img[i + 2] / 255;
 
-      const p = i * 4;
-      rgba[p + 0] = 0;
-      rgba[p + 1] = 0;
-      rgba[p + 2] = 0;
-      rgba[p + 3] = a;
+      data[p]         = (r - 0.5) / 0.5;
+      data[p + HW]    = (g - 0.5) / 0.5;
+      data[p + 2*HW]  = (b - 0.5) / 0.5;
     }
   }
 
+  return new ort.Tensor("float32", data, [1, 3, H, W]);
+}
+
+function parseOutputToAlpha(outTensor) {
+  const dims = outTensor.dims;
+  const data = outTensor.data; // typed array
+
+  // support NCHW or NHWC
+  let H, W, layout;
+  if (dims.length === 4) {
+    const [N, d1, d2, d3] = dims;
+    if (d1 <= 4 && d2 > 4 && d3 > 4) {
+      layout = "NCHW";
+      H = d2; W = d3;
+    } else if (d3 <= 4 && d1 > 4 && d2 > 4) {
+      layout = "NHWC";
+      H = d1; W = d2;
+    } else {
+      // default assume NCHW
+      layout = "NCHW";
+      H = d2; W = d3;
+    }
+  } else if (dims.length === 3) {
+    // [1, H, W]
+    layout = "HW";
+    H = dims[1]; W = dims[2];
+  } else {
+    throw new Error("Unexpected output dims: " + JSON.stringify(dims));
+  }
+
+  const alpha = new Float32Array(H * W);
+
+  // sample a bunch to decide if we need sigmoid (usually MODNet matte is already 0..1)
+  let outOf01 = 0;
+  const S = 2048;
+  for (let s = 0; s < S; s++) {
+    const idx = (s * 9973) % (H * W);
+    let v;
+    if (layout === "NCHW") v = data[idx];               // c=0
+    else if (layout === "NHWC") v = data[idx * dims[3]];// c=0
+    else v = data[idx];
+
+    if (!Number.isFinite(v) || v < -0.2 || v > 1.2) outOf01++;
+  }
+  const needSigmoid = (outOf01 / S) > 0.25;
+
+  for (let i = 0; i < H * W; i++) {
+    let v;
+    if (layout === "NCHW") v = data[i];                // c=0
+    else if (layout === "NHWC") v = data[i * dims[3]]; // c=0
+    else v = data[i];
+
+    if (!Number.isFinite(v)) v = 0;
+
+    if (needSigmoid) v = 1 / (1 + Math.exp(-v));
+    // clamp
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    alpha[i] = v;
+  }
+
+  return { alpha, H, W, needSigmoid };
+}
+
+function maybeInvertAlpha(alpha, W, H) {
+  // decide invert by comparing center vs border
+  let center = 0, border = 0, cN = 0, bN = 0;
+
+  const cx0 = Math.floor(W * 0.35), cx1 = Math.floor(W * 0.65);
+  const cy0 = Math.floor(H * 0.35), cy1 = Math.floor(H * 0.65);
+
+  for (let y = cy0; y < cy1; y += 2) {
+    for (let x = cx0; x < cx1; x += 2) {
+      center += alpha[y * W + x];
+      cN++;
+    }
+  }
+
+  // border ring
+  const ring = Math.max(8, Math.floor(Math.min(W, H) * 0.12));
+  for (let y = 0; y < H; y += 3) {
+    for (let x = 0; x < W; x += 3) {
+      const isBorder = (x < ring || x >= W - ring || y < ring || y >= H - ring);
+      if (!isBorder) continue;
+      border += alpha[y * W + x];
+      bN++;
+    }
+  }
+
+  const cMean = cN ? center / cN : 0.5;
+  const bMean = bN ? border / bN : 0.5;
+
+  // if center is lower than border, likely inverted
+  const invert = cMean < bMean;
+
+  if (invert) {
+    for (let i = 0; i < alpha.length; i++) alpha[i] = 1 - alpha[i];
+  }
+
+  return { invert, cMean, bMean };
+}
+
+function alphaStats(alpha) {
+  // light sampling for speed
+  const n = alpha.length;
+  const S = Math.min(4096, n);
+  let min = 1, max = 0, sum = 0;
+  for (let s = 0; s < S; s++) {
+    const i = (s * 7919) % n;
+    const v = alpha[i];
+    if (v < min) min = v;
+    if (v > max) max = v;
+    sum += v;
+  }
+  return { min, max, mean: sum / S };
+}
+
+function updateMaskCanvas(alpha, W, H) {
+  // write RGBA mask (alpha channel)
+  const img = maskCtx.createImageData(W, H);
+  const d = img.data;
+
+  for (let i = 0; i < W * H; i++) {
+    const a = Math.round(alpha[i] * 255);
+    d[i*4 + 0] = 0;
+    d[i*4 + 1] = 0;
+    d[i*4 + 2] = 0;
+    d[i*4 + 3] = a;
+  }
   maskCtx.putImageData(img, 0, 0);
-  maskReady = true;
 }
 
-async function startCamera() {
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: {
-      // If you want front camera on phones, uncomment:
-      // facingMode: "user",
-      width: { ideal: 1280 },
-      height: { ideal: 720 },
-      frameRate: { ideal: 30 },
-    },
-    audio: false,
+function drawComposite() {
+  const w = out.width, h = out.height;
+  if (!w || !h) return;
+
+  // background
+  const bg = getBGMode();
+  outCtx.save();
+  outCtx.globalCompositeOperation = "source-over";
+  outCtx.filter = "none";
+
+  if (bg === "green") {
+    outCtx.fillStyle = "#00ff00";
+    outCtx.fillRect(0, 0, w, h);
+  } else if (bg === "blur") {
+    outCtx.filter = "blur(10px)";
+    drawVideoCover(outCtx, w, h, MIRROR);
+    outCtx.filter = "none";
+  } else {
+    outCtx.fillStyle = "#ffffff";
+    outCtx.fillRect(0, 0, w, h);
+  }
+
+  // foreground video
+  drawVideoCover(outCtx, w, h, MIRROR);
+
+  // apply matte if ready
+  if (matteReady) {
+    outCtx.globalCompositeOperation = "destination-in";
+    // scale mask to output size
+    outCtx.drawImage(maskCanvas, 0, 0, w, h);
+    outCtx.globalCompositeOperation = "source-over";
+  }
+
+  outCtx.restore();
+}
+
+async function initSessionWebGPU(modelPath) {
+  // WebGPU EP
+  // Note: Some devices have unstable/incorrect output on WebGPU; we will sanity-check & fallback.
+  const sess = await ort.InferenceSession.create(modelPath, {
+    executionProviders: ["webgpu"],
   });
-  video.srcObject = stream;
-  await video.play();
+  return sess;
 }
 
-function stopCamera() {
-  const s = video.srcObject;
-  if (s && s.getTracks) s.getTracks().forEach((t) => t.stop());
-  video.srcObject = null;
-}
+async function initSessionWASM(modelPath) {
+  const hc = navigator.hardwareConcurrency || 4;
 
-function configureCanvasSizes() {
-  const vw = video.videoWidth || 1280;
-  const vh = video.videoHeight || 720;
+  ort.env.wasm.wasmPaths = WASM_BASE;
+  ort.env.wasm.numThreads = Math.max(1, Math.min(8, hc));
+  ort.env.wasm.simd = true;
 
-  const outW = 480;
-  const outH = Math.round(outW * (vh / vw));
-  out.width = outW;
-  out.height = outH;
+  const sess = await ort.InferenceSession.create(modelPath, {
+    executionProviders: ["wasm"],
+  });
+  return sess;
 }
 
 async function initModel() {
-  const hc = navigator.hardwareConcurrency || 4;
-  ort.env.wasm.numThreads = Math.max(1, Math.min(MAX_WASM_THREADS, hc));
+  logStatus(
+    `Loading model...\nsecureContext=${window.isSecureContext}\n` +
+    `crossOriginIsolated=${window.crossOriginIsolated}\n` +
+    `navigator.gpu=${!!navigator.gpu}\n`
+  );
 
-  // Absolute URL so it doesn't resolve to cdn.jsdelivr.net/wasm/...
-  const ORIGIN = window.location.origin;
-  ort.env.wasm.wasmPaths = `${ORIGIN}/wasm/`;
+  // Always set wasm paths early (even WebGPU EP may internally reference wasm pieces on fallback paths)
+  ort.env.wasm.wasmPaths = WASM_BASE;
 
-  const base = "/models/Xenova/modnet/onnx";
-  const modelWebGPU = `${base}/model_fp16.onnx`;
-  const modelFP32   = `${base}/model.onnx`;
-  const modelUint8  = `${base}/model_uint8.onnx`;
-
-  const canWebGPU = !!navigator.gpu && window.isSecureContext;
-
-  session = null;
-  using = "none";
-
-  if (canWebGPU) {
+  // Try WebGPU fp16 -> WebGPU fp32 -> WASM fp32
+  // (fp16 often fails on many Android devices)
+  if (navigator.gpu) {
     try {
-      setStatus("Loading model… try WebGPU (fp16)…");
-      session = await ort.InferenceSession.create(modelWebGPU, {
-        executionProviders: ["webgpu"],
-      });
-      using = "webgpu/fp16";
+      logStatus(statusEl.textContent + "\nLoading model… try WebGPU (fp16)…");
+      session = await initSessionWebGPU(MODEL_FP16);
+      usingEP = "webgpu/fp16";
     } catch (e1) {
       console.warn("WebGPU fp16 failed:", e1);
       try {
-        setStatus("Loading model… try WebGPU (fp32)…");
-        session = await ort.InferenceSession.create(modelFP32, {
-          executionProviders: ["webgpu"],
-        });
-        using = "webgpu/fp32";
+        logStatus(statusEl.textContent + "\nLoading model… try WebGPU (fp32)…");
+        session = await initSessionWebGPU(MODEL_FP32);
+        usingEP = "webgpu/fp32";
       } catch (e2) {
         console.warn("WebGPU fp32 failed:", e2);
       }
@@ -288,203 +424,170 @@ async function initModel() {
   }
 
   if (!session) {
-    try {
-      setStatus(`Loading model… fallback WASM (fp32, threads=${ort.env.wasm.numThreads})…`);
-      session = await ort.InferenceSession.create(modelFP32, {
-        executionProviders: ["wasm"],
-      });
-      using = "wasm/fp32";
-    } catch (e3) {
-      console.warn("WASM fp32 failed:", e3);
-      setStatus(`Loading model… fallback WASM (uint8, threads=${ort.env.wasm.numThreads})…`);
-      session = await ort.InferenceSession.create(modelUint8, {
-        executionProviders: ["wasm"],
-      });
-      using = "wasm/uint8";
-    }
+    logStatus(statusEl.textContent + `\nLoading model… fallback WASM (fp32)…`);
+    session = await initSessionWASM(MODEL_FP32);
+    usingEP = "wasm/fp32";
   }
 
-  if (!session) throw new Error("Model init failed (WebGPU and WASM both failed).");
+  // names
+  inputName = session.inputNames?.[0] ?? "input";
+  outputName = session.outputNames?.[0] ?? "output";
 
-  inputName  = session.inputNames?.[0]  || "input";
-  outputName = session.outputNames?.[0] || "output";
+  badMatteStreak = 0;
+  matteReady = false;
 
-  setStatus(`Model ready ✅ (${using})\nthreads=${ort.env.wasm.numThreads}\ninput=${inputName}\noutput=${outputName}`);
+  logStatus(
+    `Model ready ✅ (${usingEP})\nthreads=${ort.env.wasm.numThreads ?? 1}\n` +
+    `input=${inputName}\noutput=${outputName}\n`
+  );
+}
+
+async function ensureCamera() {
+  logStatus("Camera starting…");
+  // Encourage a decent resolution (helps matte quality)
+  const constraints = {
+    audio: false,
+    video: {
+      facingMode: "user",
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+    },
+  };
+
+  stream = await navigator.mediaDevices.getUserMedia(constraints);
+  video.srcObject = stream;
+
+  await new Promise((resolve) => {
+    video.onloadedmetadata = () => resolve();
+  });
+  await video.play();
+
+  setCanvasSizes();
+  logStatus(statusEl.textContent + "\nCamera ready.");
 }
 
 async function inferOnce() {
-  if (!running || !session) return;
+  // draw to infer canvas using same crop logic (but infer size)
+  drawVideoCover(inferCtx, inferCanvas.width, inferCanvas.height, MIRROR);
 
-  const outW = out.width, outH = out.height;
-  const shortEdge = parseInt(inferSizeSel?.value || "256", 10);
+  const inputTensor = buildInputTensorFloat32();
 
-  // keep aspect aligned to output
-  let iw, ih;
-  if (outW <= outH) {
-    iw = shortEdge;
-    ih = Math.round(shortEdge * (outH / outW));
-  } else {
-    ih = shortEdge;
-    iw = Math.round(shortEdge * (outW / outH));
-  }
-
-  iw = roundDownTo(iw, 32);
-  ih = roundDownTo(ih, 32);
-
-  inferCanvas.width = iw;
-  inferCanvas.height = ih;
-
-  const zoom = currentZoom();
-  drawVideoCover(inferCtx, video, iw, ih, MIRROR, zoom);
-
-  const inputTensor = buildInputTensorFromCanvas(inferCtx, iw, ih);
-  const feeds = { [inputName]: inputTensor };
+  const feeds = {};
+  feeds[inputName] = inputTensor;
 
   const results = await session.run(feeds);
-  const outTensor = results[outputName] || results[session.outputNames[0]];
-  if (!outTensor) throw new Error("No output tensor found.");
+  const outTensor = results[outputName];
 
-  updateMaskFromOutput(outTensor);
+  const { alpha, H, W } = parseOutputToAlpha(outTensor);
+  const inv = maybeInvertAlpha(alpha, W, H);
+  const st = alphaStats(alpha);
+
+  // sanity: if matte is basically empty for several frames, do NOT apply (prevents "all white")
+  const isBad = (st.mean < MIN_MEAN_ALPHA && st.max < MIN_MAX_ALPHA);
+
+  if (isBad) {
+    badMatteStreak++;
+    console.warn("Bad matte:", { ...st, ...inv, badMatteStreak, usingEP });
+    if (badMatteStreak >= BAD_STREAK_TO_FALLBACK && usingEP.startsWith("webgpu")) {
+      // Known: WebGPU can be unstable on some devices/GPUs; fallback to WASM for correctness.:contentReference[oaicite:2]{index=2}
+      logStatus(statusEl.textContent + "\nWebGPU matte unstable → fallback to WASM…");
+      session = await initSessionWASM(MODEL_FP32);
+      usingEP = "wasm/fp32";
+      inputName = session.inputNames?.[0] ?? "input";
+      outputName = session.outputNames?.[0] ?? "output";
+      badMatteStreak = 0;
+      matteReady = false;
+      return;
+    }
+
+    // If we have a last-good mask, keep using it. Otherwise disable matte (show raw video).
+    if (lastGoodMask.width === maskCanvas.width && lastGoodMask.height === maskCanvas.height) {
+      maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+      maskCtx.drawImage(lastGoodMask, 0, 0);
+      matteReady = true;
+    } else {
+      matteReady = false;
+    }
+    return;
+  }
+
+  badMatteStreak = 0;
+
+  updateMaskCanvas(alpha, W, H);
+
+  // store last good
+  lastGoodCtx.clearRect(0, 0, lastGoodMask.width, lastGoodMask.height);
+  lastGoodCtx.drawImage(maskCanvas, 0, 0);
+
+  matteReady = true;
+
+  // optional: show debug stats in status (comment out if noisy)
+  // logStatus(`Model ready ✅ (${usingEP})\nmean=${st.mean.toFixed(3)} max=${st.max.toFixed(3)} invert=${inv.invert}\nRunning…`);
 }
 
-function drawOnce() {
+function loop() {
   if (!running) return;
 
-  const outW = out.width, outH = out.height;
-  const bgMode = bgSel?.value || "white";
-  const zoom = currentZoom();
+  // draw every frame (smooth preview), but inference throttled by Infer FPS
+  drawComposite();
 
-  outCtx.save();
-  outCtx.setTransform(1, 0, 0, 1, 0, 0);
-  outCtx.clearRect(0, 0, outW, outH);
+  const fps = getInferFPS();
+  const now = performance.now();
+  const interval = 1000 / fps;
 
-  // Background
-  if (bgMode === "white") {
-    outCtx.fillStyle = "#ffffff";
-    outCtx.fillRect(0, 0, outW, outH);
-  } else if (bgMode === "green") {
-    outCtx.fillStyle = "#00ff00";
-    outCtx.fillRect(0, 0, outW, outH);
-  } else if (bgMode === "blur") {
-    outCtx.filter = "blur(10px)";
-    drawVideoCover(outCtx, video, outW, outH, MIRROR, zoom);
-    outCtx.filter = "none";
-  } else {
-    outCtx.fillStyle = "#ffffff";
-    outCtx.fillRect(0, 0, outW, outH);
+  if (now - lastInferTS >= interval) {
+    lastInferTS = now;
+    inferOnce().catch((e) => {
+      console.error("infer error:", e);
+      // if inference fails, avoid leaving a broken matte applied
+      matteReady = false;
+    });
   }
 
-  // Foreground + mask
-  outCtx.save();
-  outCtx.globalCompositeOperation = "source-over";
-  drawVideoCover(outCtx, video, outW, outH, MIRROR, zoom);
-
-  if (maskReady && maskCanvas.width > 0 && maskCanvas.height > 0) {
-    outCtx.globalCompositeOperation = "destination-in";
-    if (MASK_BLUR_PX > 0) outCtx.filter = `blur(${MASK_BLUR_PX}px)`;
-    outCtx.drawImage(maskCanvas, 0, 0, outW, outH);
-    outCtx.filter = "none";
-  }
-
-  outCtx.restore();
-  outCtx.restore();
-}
-
-function stopLoop() {
-  if (loopTimer) {
-    clearTimeout(loopTimer);
-    loopTimer = null;
-  }
-}
-
-function scheduleNextTick(delayMs) {
-  loopTimer = setTimeout(tick, Math.max(0, delayMs));
-}
-
-// FPS synced loop: infer -> draw -> wait
-async function tick() {
-  if (!running) return;
-
-  const fps = parseInt(fpsSel?.value || "10", 10);
-  const targetMs = 1000 / Math.max(1, fps);
-
-  const t0 = performance.now();
-  try {
-    await inferOnce();
-    drawOnce();
-  } catch (e) {
-    console.error(e);
-    setStatus(`Runtime error ❌\n${e?.message || e}`);
-  }
-  const t1 = performance.now();
-
-  const elapsed = t1 - t0;
-  const delay = targetMs - elapsed;
-  scheduleNextTick(delay);
+  requestAnimationFrame(loop);
 }
 
 async function start() {
-  if (running) return;
-  running = true;
-
-  startBtn.disabled = true;
-  stopBtn.disabled = false;
-
   try {
-    setStatus("Camera starting…");
-    await startCamera();
+    syncFPS();
 
-    configureCanvasSizes();
-
-    setStatus(
-      `Camera ready.\nsecureContext=${window.isSecureContext}\n` +
-      `crossOriginIsolated=${window.crossOriginIsolated}\n` +
-      `navigator.gpu=${!!navigator.gpu}\n` +
-      `out=${out.width}x${out.height}\n` +
-      `zoom=${currentZoom().toFixed(2)}`
-    );
-
-    maskReady = false;
-
-    setStatus("Loading model…");
+    await ensureCamera();
     await initModel();
 
-    setStatus(statusEl.textContent + "\nRunning…");
-    stopLoop();
-    scheduleNextTick(0);
-
+    running = true;
+    lastInferTS = 0;
+    logStatus(statusEl.textContent + "Running…");
+    requestAnimationFrame(loop);
   } catch (e) {
     console.error(e);
-    setStatus(`Start failed ❌\n${e?.message || e}`);
-    running = false;
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
+    logStatus("Start failed ❌\n" + (e?.message || e));
   }
 }
 
 function stop() {
   running = false;
-  stopLoop();
-  stopCamera();
+  matteReady = false;
+  badMatteStreak = 0;
 
-  session = null;
-  maskReady = false;
+  if (stream) {
+    for (const t of stream.getTracks()) t.stop();
+    stream = null;
+  }
+  video.srcObject = null;
 
-  startBtn.disabled = false;
-  stopBtn.disabled = true;
-
-  setStatus("Stopped.");
+  outCtx.clearRect(0, 0, out.width, out.height);
+  logStatus("stopped");
 }
 
-stopBtn.disabled = true;
 startBtn.addEventListener("click", start);
 stopBtn.addEventListener("click", stop);
 
-[fpsSel, inferSizeSel, bgSel].forEach((el) => {
-  if (!el) return;
-  el.addEventListener("change", () => {
-    if (!running) return;
-    stopLoop();
-    scheduleNextTick(0);
-  });
+// If user changes infer size mid-run, resize tensors/canvases safely
+inferSizeSel?.addEventListener("change", () => {
+  if (!video.videoWidth) return;
+  setCanvasSizes();
 });
+
+// Keep fps synced even if only one exists
+inferFpsSel?.addEventListener("change", () => {});
+drawFpsSel?.addEventListener("change", () => {});
