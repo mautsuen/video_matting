@@ -1,13 +1,6 @@
 // main.js (FPS synced: infer + draw same tick, uniform zoom to avoid distortion on portrait)
-import * as ort from "./dist/ort.webgpu.min.mjs";
-
-ort.env.wasm.wasmPaths = new URL("./wasm/", window.location.href).toString();
-ort.env.wasm.numThreads = 1;
-
-// 若你要開多執行緒再改成：
-// const hc = navigator.hardwareConcurrency || 4;
-// ort.env.wasm.numThreads = window.crossOriginIsolated ? Math.min(8, hc) : 1;
-
+// ✅ Mobile default WASM (skip WebGPU on phones)
+import * as ort from "./dist/ort.all.min.mjs";
 
 const $ = (id) => document.getElementById(id);
 
@@ -29,6 +22,9 @@ const inferCtx = inferCanvas.getContext("2d", { willReadFrequently: true });
 const maskCanvas = document.createElement("canvas");
 const maskCtx = maskCanvas.getContext("2d", { willReadFrequently: true });
 
+// ====== Device detect ======
+const IS_MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
 // ====== Tunables ======
 const MIRROR = true;
 
@@ -46,6 +42,7 @@ const MAX_WASM_THREADS = 8;
 // ====== State ======
 let running = false;
 let loopTimer = null;
+let tickToken = 0;
 
 let session = null;
 let inputName = null;
@@ -256,13 +253,17 @@ function configureCanvasSizes() {
   out.height = outH;
 }
 
-async function initModel() {
-  const hc = navigator.hardwareConcurrency || 4;
-  ort.env.wasm.numThreads = Math.max(1, Math.min(MAX_WASM_THREADS, hc));
+function configureOrtWasm() {
+  // ✅ 統一從 /wasm/ 載入（你已經放齊 ort-wasm-*）
+  ort.env.wasm.wasmPaths = new URL("./wasm/", window.location.href).toString();
 
-  // Absolute URL so it doesn't resolve to cdn.jsdelivr.net/wasm/...
-  const ORIGIN = window.location.origin;
-  ort.env.wasm.wasmPaths = `${ORIGIN}/wasm/`;
+  const hc = navigator.hardwareConcurrency || 4;
+  const threads = IS_MOBILE ? 1 : Math.max(1, Math.min(MAX_WASM_THREADS, hc));
+  ort.env.wasm.numThreads = threads;
+}
+
+async function initModel() {
+  configureOrtWasm();
 
   const base = "/models/Xenova/modnet/onnx";
   const modelWebGPU = `${base}/model_fp16.onnx`;
@@ -274,7 +275,8 @@ async function initModel() {
   session = null;
   using = "none";
 
-  if (canWebGPU) {
+  // ✅ Mobile default WASM: skip WebGPU completely
+  if (!IS_MOBILE && canWebGPU) {
     try {
       setStatus("Loading model… try WebGPU (fp16)…");
       session = await ort.InferenceSession.create(modelWebGPU, {
@@ -293,18 +295,21 @@ async function initModel() {
         console.warn("WebGPU fp32 failed:", e2);
       }
     }
+  } else {
+    // For visibility in logs/UI
+    setStatus(`Loading model… ${IS_MOBILE ? "mobile detected → use WASM" : "WebGPU unavailable → use WASM"}…`);
   }
 
   if (!session) {
     try {
-      setStatus(`Loading model… fallback WASM (fp32, threads=${ort.env.wasm.numThreads})…`);
+      setStatus(`Loading model… WASM (fp32, threads=${ort.env.wasm.numThreads})…`);
       session = await ort.InferenceSession.create(modelFP32, {
         executionProviders: ["wasm"],
       });
       using = "wasm/fp32";
     } catch (e3) {
       console.warn("WASM fp32 failed:", e3);
-      setStatus(`Loading model… fallback WASM (uint8, threads=${ort.env.wasm.numThreads})…`);
+      setStatus(`Loading model… WASM (uint8, threads=${ort.env.wasm.numThreads})…`);
       session = await ort.InferenceSession.create(modelUint8, {
         executionProviders: ["wasm"],
       });
@@ -312,12 +317,18 @@ async function initModel() {
     }
   }
 
-  if (!session) throw new Error("Model init failed (WebGPU and WASM both failed).");
+  if (!session) throw new Error("Model init failed (no backend available).");
 
   inputName  = session.inputNames?.[0]  || "input";
   outputName = session.outputNames?.[0] || "output";
 
-  setStatus(`Model ready ✅ (${using})\nthreads=${ort.env.wasm.numThreads}\ninput=${inputName}\noutput=${outputName}`);
+  setStatus(
+    `Model ready ✅ (${using})\n` +
+    `mobile=${IS_MOBILE}\n` +
+    `threads=${ort.env.wasm.numThreads}\n` +
+    `input=${inputName}\n` +
+    `output=${outputName}`
+  );
 }
 
 async function inferOnce() {
@@ -406,12 +417,13 @@ function stopLoop() {
 }
 
 function scheduleNextTick(delayMs) {
-  loopTimer = setTimeout(tick, Math.max(0, delayMs));
+  const myToken = tickToken;
+  loopTimer = setTimeout(() => tick(myToken), Math.max(0, delayMs));
 }
 
 // FPS synced loop: infer -> draw -> wait
-async function tick() {
-  if (!running) return;
+async function tick(myToken) {
+  if (!running || myToken !== tickToken) return;
 
   const fps = parseInt(fpsSel?.value || "10", 10);
   const targetMs = 1000 / Math.max(1, fps);
@@ -426,6 +438,8 @@ async function tick() {
   }
   const t1 = performance.now();
 
+  if (!running || myToken !== tickToken) return;
+
   const elapsed = t1 - t0;
   const delay = targetMs - elapsed;
   scheduleNextTick(delay);
@@ -434,6 +448,7 @@ async function tick() {
 async function start() {
   if (running) return;
   running = true;
+  tickToken++; // invalidate old ticks
 
   startBtn.disabled = true;
   stopBtn.disabled = false;
@@ -448,6 +463,7 @@ async function start() {
       `Camera ready.\nsecureContext=${window.isSecureContext}\n` +
       `crossOriginIsolated=${window.crossOriginIsolated}\n` +
       `navigator.gpu=${!!navigator.gpu}\n` +
+      `mobile=${IS_MOBILE}\n` +
       `out=${out.width}x${out.height}\n` +
       `zoom=${currentZoom().toFixed(2)}`
     );
@@ -472,6 +488,7 @@ async function start() {
 
 function stop() {
   running = false;
+  tickToken++; // stop future reschedules
   stopLoop();
   stopCamera();
 
@@ -492,6 +509,7 @@ stopBtn.addEventListener("click", stop);
   if (!el) return;
   el.addEventListener("change", () => {
     if (!running) return;
+    tickToken++; // prevent overlapping ticks
     stopLoop();
     scheduleNextTick(0);
   });
