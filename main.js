@@ -1,4 +1,4 @@
-// main.js (FPS synced: infer + draw always same tick)
+// main.js (FPS synced: infer + draw same tick, uniform zoom to avoid distortion on portrait)
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/ort.all.min.mjs";
 
 const $ = (id) => document.getElementById(id);
@@ -24,12 +24,13 @@ const maskCtx = maskCanvas.getContext("2d", { willReadFrequently: true });
 // ====== Tunables ======
 const MIRROR = true;
 
-// Python-like portrait zoom (helps keep face)
-const ZOOM_X = 1.35;
-const ZOOM_Y = 1.00;
+// ✅ Uniform zoom only (NO ZOOM_X/ZOOM_Y)
+// Portrait phones: keep zoom near 1.0 to avoid warping faces
+const ZOOM_LANDSCAPE = 1.20; // mild zoom-in on PC
+const ZOOM_PORTRAIT  = 1.00; // critical: no anisotropic zoom on phone portrait
 
-const AUTO_INVERT = true; // if mask seems inverted, auto fix
-const MASK_GAMMA  = 0.75; // <1 makes foreground stronger (helps face)
+const AUTO_INVERT = true;
+const MASK_GAMMA  = 0.75;
 const MASK_BLUR_PX = 1.2;
 
 const MAX_WASM_THREADS = 8;
@@ -58,14 +59,25 @@ function roundDownTo(n, d) {
   return Math.max(d, Math.floor(n / d) * d);
 }
 
-function drawVideoCover(ctx, vid, dstW, dstH, mirror, zoomX = 1.0, zoomY = 1.0) {
+// Decide zoom based on current orientation (video or canvas)
+function currentZoom() {
+  const vw = video.videoWidth || 0;
+  const vh = video.videoHeight || 0;
+  const portrait = (vh > vw) || (out.height > out.width);
+  return portrait ? ZOOM_PORTRAIT : ZOOM_LANDSCAPE;
+}
+
+// ✅ Uniform "cover + zoom" (single zoom factor, no distortion)
+function drawVideoCover(ctx, vid, dstW, dstH, mirror, zoom = 1.0) {
   const vw = vid.videoWidth || 1;
   const vh = vid.videoHeight || 1;
 
+  // base cover scale
   const baseScale = Math.max(dstW / vw, dstH / vh);
 
-  const sw = dstW / (baseScale * zoomX);
-  const sh = dstH / (baseScale * zoomY);
+  // uniform zoom => sw/sh shrink together => no aspect warping
+  const sw = dstW / (baseScale * zoom);
+  const sh = dstH / (baseScale * zoom);
 
   const sx = (vw - sw) * 0.5;
   const sy = (vh - sh) * 0.5;
@@ -85,6 +97,7 @@ function buildInputTensorFromCanvas(ctx, w, h) {
   const chw = new Float32Array(3 * w * h);
   const area = w * h;
 
+  // normalize: v/127.5 - 1
   for (let i = 0; i < area; i++) {
     const r = data[i * 4 + 0];
     const g = data[i * 4 + 1];
@@ -190,8 +203,8 @@ function updateMaskFromOutput(outTensor) {
       if (doInvert) v = 1.0 - v;
 
       v = Math.pow(v, MASK_GAMMA);
-
       const a = Math.round(clamp01(v) * 255);
+
       const p = i * 4;
       rgba[p + 0] = 0;
       rgba[p + 1] = 0;
@@ -207,6 +220,8 @@ function updateMaskFromOutput(outTensor) {
 async function startCamera() {
   const stream = await navigator.mediaDevices.getUserMedia({
     video: {
+      // If you want front camera on phones, uncomment:
+      // facingMode: "user",
       width: { ideal: 1280 },
       height: { ideal: 720 },
       frameRate: { ideal: 30 },
@@ -237,7 +252,7 @@ async function initModel() {
   const hc = navigator.hardwareConcurrency || 4;
   ort.env.wasm.numThreads = Math.max(1, Math.min(MAX_WASM_THREADS, hc));
 
-  // ✅ IMPORTANT: absolute URL so it doesn't resolve to cdn.jsdelivr.net/wasm/...
+  // Absolute URL so it doesn't resolve to cdn.jsdelivr.net/wasm/...
   const ORIGIN = window.location.origin;
   ort.env.wasm.wasmPaths = `${ORIGIN}/wasm/`;
 
@@ -319,7 +334,8 @@ async function inferOnce() {
   inferCanvas.width = iw;
   inferCanvas.height = ih;
 
-  drawVideoCover(inferCtx, video, iw, ih, MIRROR, ZOOM_X, ZOOM_Y);
+  const zoom = currentZoom();
+  drawVideoCover(inferCtx, video, iw, ih, MIRROR, zoom);
 
   const inputTensor = buildInputTensorFromCanvas(inferCtx, iw, ih);
   const feeds = { [inputName]: inputTensor };
@@ -336,6 +352,7 @@ function drawOnce() {
 
   const outW = out.width, outH = out.height;
   const bgMode = bgSel?.value || "white";
+  const zoom = currentZoom();
 
   outCtx.save();
   outCtx.setTransform(1, 0, 0, 1, 0, 0);
@@ -350,17 +367,17 @@ function drawOnce() {
     outCtx.fillRect(0, 0, outW, outH);
   } else if (bgMode === "blur") {
     outCtx.filter = "blur(10px)";
-    drawVideoCover(outCtx, video, outW, outH, MIRROR, ZOOM_X, ZOOM_Y);
+    drawVideoCover(outCtx, video, outW, outH, MIRROR, zoom);
     outCtx.filter = "none";
   } else {
     outCtx.fillStyle = "#ffffff";
     outCtx.fillRect(0, 0, outW, outH);
   }
 
-  // If we don't have a mask yet, just show the raw (cropped) video on top
+  // Foreground + mask
   outCtx.save();
   outCtx.globalCompositeOperation = "source-over";
-  drawVideoCover(outCtx, video, outW, outH, MIRROR, ZOOM_X, ZOOM_Y);
+  drawVideoCover(outCtx, video, outW, outH, MIRROR, zoom);
 
   if (maskReady && maskCanvas.width > 0 && maskCanvas.height > 0) {
     outCtx.globalCompositeOperation = "destination-in";
@@ -384,7 +401,7 @@ function scheduleNextTick(delayMs) {
   loopTimer = setTimeout(tick, Math.max(0, delayMs));
 }
 
-// ✅ FPS synced loop: infer -> draw -> wait
+// FPS synced loop: infer -> draw -> wait
 async function tick() {
   if (!running) return;
 
@@ -398,14 +415,11 @@ async function tick() {
   } catch (e) {
     console.error(e);
     setStatus(`Runtime error ❌\n${e?.message || e}`);
-    // keep trying next ticks anyway
   }
   const t1 = performance.now();
 
   const elapsed = t1 - t0;
   const delay = targetMs - elapsed;
-
-  // if inference is slower than target, delay will be <=0 -> run again immediately
   scheduleNextTick(delay);
 }
 
@@ -426,7 +440,8 @@ async function start() {
       `Camera ready.\nsecureContext=${window.isSecureContext}\n` +
       `crossOriginIsolated=${window.crossOriginIsolated}\n` +
       `navigator.gpu=${!!navigator.gpu}\n` +
-      `out=${out.width}x${out.height}`
+      `out=${out.width}x${out.height}\n` +
+      `zoom=${currentZoom().toFixed(2)}`
     );
 
     maskReady = false;
@@ -465,8 +480,6 @@ stopBtn.disabled = true;
 startBtn.addEventListener("click", start);
 stopBtn.addEventListener("click", stop);
 
-// if user changes FPS/size/bg, it takes effect next tick automatically.
-// but restart loop immediately to feel responsive:
 [fpsSel, inferSizeSel, bgSel].forEach((el) => {
   if (!el) return;
   el.addEventListener("change", () => {
