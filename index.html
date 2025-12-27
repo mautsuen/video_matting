@@ -25,21 +25,14 @@
     <button id="stop">Stop</button>
 
     <label>
-      Draw FPS:
+      FPS:
       <select id="fps">
-        <option value="10">10</option>
-        <option value="20">20</option>
-        <option value="30" selected>30</option>
-      </select>
-    </label>
-
-    <label>
-      Infer FPS:
-      <select id="inferFps">
         <option value="2">2</option>
         <option value="5">5</option>
         <option value="10" selected>10</option>
         <option value="15">15</option>
+        <option value="20">20</option>
+        <option value="30">30</option>
       </select>
     </label>
 
@@ -65,7 +58,7 @@
 
   <p id="status">idle</p>
   <div class="hint">
-    Tip: 畫面順暢看 Draw FPS；速度主要看 Infer FPS + Infer short edge。建議先用 512 + 5~10 fps 推論。
+    Tip: FPS 會同時控制「推論 + 繪製」(完全同步)。若手機品質不好/很慢，先降 FPS 或 Infer short edge。
   </div>
 
   <div class="row">
