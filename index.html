@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Browser MODNet (Render Static Site)</title>
+  <style>
+    body{font-family:sans-serif;padding:12px}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    video,canvas{width:480px;max-width:100%;border:1px solid #ccc}
+  </style>
+</head>
+<body>
+  <h2>MODNet background removal (in-browser)</h2>
+  <button id="start">Start</button>
+  <button id="stop">Stop</button>
+  <label style="margin-left:8px">
+    FPS:
+    <select id="fps">
+      <option value="5">5</option>
+      <option value="10">10</option>
+      <option value="2">2</option>
+    </select>
+  </label>
+  <p id="status">idle</p>
+
+  <div class="row">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="out"></canvas>
+  </div>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
+
