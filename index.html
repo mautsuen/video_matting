@@ -3,26 +3,69 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Browser MODNet (Render Static Site)</title>
+  <title>MODNet (onnxruntime-web)</title>
+  <link rel="icon" href="data:," />
   <style>
-    body{font-family:sans-serif;padding:12px}
-    .row{display:flex;gap:12px;flex-wrap:wrap}
-    video,canvas{width:480px;max-width:100%;border:1px solid #ccc}
+    body { font-family: sans-serif; padding: 12px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start; }
+    video, canvas { width: 480px; max-width: 100%; border: 1px solid #ccc; }
+    .controls { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
+    .controls label { display: inline-flex; gap: 6px; align-items: center; }
+    #status { margin: 8px 0; white-space: pre-wrap; }
+    .hint { color: #666; font-size: 13px; margin-top: 6px; }
+    select, button { padding: 4px 8px; }
   </style>
 </head>
 <body>
-  <h2>MODNet background removal (in-browser)</h2>
-  <button id="start">Start</button>
-  <button id="stop">Stop</button>
-  <label style="margin-left:8px">
-    FPS:
-    <select id="fps">
-      <option value="5">5</option>
-      <option value="10">10</option>
-      <option value="2">2</option>
-    </select>
-  </label>
+  <h2>MODNet background removal (in-browser, ORT)</h2>
+
+  <div class="controls">
+    <button id="start">Start</button>
+    <button id="stop">Stop</button>
+
+    <label>
+      Draw FPS:
+      <select id="fps">
+        <option value="10">10</option>
+        <option value="20">20</option>
+        <option value="30" selected>30</option>
+      </select>
+    </label>
+
+    <label>
+      Infer FPS:
+      <select id="inferFps">
+        <option value="2">2</option>
+        <option value="5">5</option>
+        <option value="10" selected>10</option>
+        <option value="15">15</option>
+      </select>
+    </label>
+
+    <label>
+      Infer short edge:
+      <select id="inferSize">
+        <option value="256">256</option>
+        <option value="320">320</option>
+        <option value="384">384</option>
+        <option value="512" selected>512</option>
+      </select>
+    </label>
+
+    <label>
+      Background:
+      <select id="bg">
+        <option value="white" selected>White</option>
+        <option value="green">Green</option>
+        <option value="blur">Blur</option>
+      </select>
+    </label>
+  </div>
+
   <p id="status">idle</p>
+  <div class="hint">
+    Tip: 畫面順暢看 Draw FPS；速度主要看 Infer FPS + Infer short edge。建議先用 512 + 5~10 fps 推論。
+  </div>
 
   <div class="row">
     <video id="video" autoplay playsinline muted></video>
@@ -32,4 +75,3 @@
   <script type="module" src="./main.js"></script>
 </body>
 </html>
-
