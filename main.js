@@ -17,7 +17,7 @@ const out    = $("out");
 const statusEl = $("status");
 
 // ====== Tunables (quality vs speed) ======
-const MIRROR = false;
+const MIRROR = true;
 
 // This mimics your Python "crop columns [120:792]" effect (zoom mostly in X).
 // Bigger -> zoom more -> face bigger -> usually better matting.
