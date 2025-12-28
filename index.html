@@ -7,9 +7,11 @@
   <link rel="icon" href="data:," />
   <style>
     body { font-family: sans-serif; padding: 12px; }
-    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start; }
-    video, canvas { width: 480px; max-width: 100%; border: 1px solid #ccc; }
-	video { transform: scaleX(-1); }
+    canvas { width: 480px; max-width: 100%; border: 1px solid #ccc; }
+
+    /* ✅ hide input video (still used for capture) */
+    video { display: none; }
+
     .controls { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
     .controls label { display: inline-flex; gap: 6px; align-items: center; }
     #status { margin: 8px 0; white-space: pre-wrap; }
@@ -27,12 +29,9 @@
     <label>
       FPS:
       <select id="fps">
-        <option value="2">2</option>
-        <option value="5">5</option>
-        <option value="10" selected>10</option>
-        <option value="15">15</option>
+        <option value="10">10</option>
         <option value="20">20</option>
-        <option value="30">30</option>
+        <option value="30" selected>30</option>
       </select>
     </label>
 
@@ -58,13 +57,14 @@
 
   <p id="status">idle</p>
   <div class="hint">
-    Tip: FPS 會同時控制「推論 + 繪製」(完全同步)。若手機品質不好/很慢，先降 FPS 或 Infer short edge。
+    Tip: FPS controls both infer+draw (same tick). Speed mainly depends on Infer short edge.
   </div>
 
-  <div class="row">
-    <video id="video" autoplay playsinline muted></video>
-    <canvas id="out"></canvas>
-  </div>
+  <!-- ✅ hidden capture source -->
+  <video id="video" autoplay playsinline muted></video>
+
+  <!-- ✅ only visible output -->
+  <canvas id="out"></canvas>
 
   <script type="module" src="./main.js"></script>
 </body>
